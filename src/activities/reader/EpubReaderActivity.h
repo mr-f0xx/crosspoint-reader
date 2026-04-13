@@ -2,7 +2,7 @@
 #include <Epub.h>
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
-
+#include "ReadingControlsMod.h"
 #include "EpubReaderMenuActivity.h"
 #include "activities/Activity.h"
 
