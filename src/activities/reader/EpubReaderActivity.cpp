@@ -24,6 +24,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/ScreenshotUtil.h"
+#include "ReadingControlsMod.h"
 
 namespace {
 // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
@@ -109,6 +110,51 @@ void EpubReaderActivity::loop() {
     return;
   }
 
+  // ── Reading Controls (Full Mod) ──────────────────────────────────────────
+  // Process all gesture state before any standard button handling so the mod
+  // can intercept and suppress actions where needed.
+  const auto rcm = _readingCtrlMod.update(mappedInput);
+
+  // Orientation change (Right hold) — mirrors the existing applyOrientation()
+  // call from the reader menu; SETTINGS.orientation is already updated by mod.
+  if (rcm.displayChanged) {
+    applyOrientation(SETTINGS.orientation);
+    return;
+  }
+
+  // Layout params changed (font / line spacing / alignment / bold) →
+  // preserve position and force section re-layout.
+  if (rcm.layoutChanged) {
+    {
+      RenderLock lock(*this);
+      if (section) {
+        cachedSpineIndex            = currentSpineIndex;
+        cachedChapterTotalPageCount = section->pageCount;
+        nextPageNumber              = section->currentPage;
+        section.reset();
+      }
+    }
+    requestUpdate();
+    return;
+  }
+
+  // Guide toggled (shown or auto-dismissed) → re-render.
+  if (rcm.guideToggled) {
+    requestUpdate();
+    return;
+  }
+
+  // Deferred back single-click confirmed after double-click window expired.
+  if (rcm.backAction == ReadingControlsMod::BackAction::GoHome) {
+    if (footnoteDepth > 0) {
+      restoreSavedPosition();
+      return;
+    }
+    onGoHome();
+    return;
+  }
+  // ── End of mod section ───────────────────────────────────────────────────
+
   if (automaticPageTurnActive) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
         mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -136,7 +182,9 @@ void EpubReaderActivity::loop() {
   }
 
   // Enter reader menu activity.
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  // Guard: skip if Confirm hold (guide) was fired this frame by the mod.
+  if (!rcm.confirmSuppressed &&
+      mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     const int currentPage = section ? section->currentPage + 1 : 0;
     const int totalPages = section ? section->pageCount : 0;
     float bookProgress = 0.0f;
@@ -159,14 +207,20 @@ void EpubReaderActivity::loop() {
                            });
   }
 
-  // Long press BACK (1s+) goes to file selection
-  if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
+  // Long press BACK (1s+) goes to file selection.
+  // Guard: only process back when the mod isn't waiting for a double-click.
+  if (rcm.backAction != ReadingControlsMod::BackAction::Pending &&
+      mappedInput.isPressed(MappedInputManager::Button::Back) &&
+      mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
     activityManager.goToFileBrowser(epub ? epub->getPath() : "");
     return;
   }
 
-  // Short press BACK goes directly to home (or restores position if viewing footnote)
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
+  // Short press BACK goes directly to home (or restores position if viewing footnote).
+  // Guard: suppress while mod is resolving a double-click on Back. The deferred
+  // GoHome action is handled at the top of loop() via rcm.backAction.
+  if (rcm.backAction != ReadingControlsMod::BackAction::Pending &&
+      mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     if (footnoteDepth > 0) {
       restoreSavedPosition();
@@ -177,6 +231,11 @@ void EpubReaderActivity::loop() {
   }
 
   auto [prevTriggered, nextTriggered] = ReaderUtils::detectPageTurn(mappedInput);
+  // Suppress page turn while Vol Up / Vol Down is in the gesture window
+  // (mod is deciding between single-click font-size change and page turn).
+  if (rcm.pageTurnSuppressed) {
+    return;
+  }
   if (!prevTriggered && !nextTriggered) {
     return;
   }
@@ -643,6 +702,14 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     const auto start = millis();
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
+
+    // ── Reading Controls guide overlay ────────────────────────────────────
+    // renderContents() has already pushed the page to the display.
+    // renderGuide() draws on top and issues its own FAST_REFRESH.
+    if (_readingCtrlMod.isGuideVisible()) {
+      _readingCtrlMod.renderGuide(renderer);
+    }
+    // ─────────────────────────────────────────────────────────────────────
   }
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
